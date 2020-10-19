@@ -31,14 +31,15 @@ for clip_name, clip_number in clip_names:
     all_pupil_traces.append(pupil_traces)
     
 
-# # Get units oracles for all 100 trials
+# Get units oracles for all 100 trials
 
 number_of_units = len(np.unique((UnitOraclesV4() & 'unit_trace_method=3').fetch('unit_id')))
 
 oracles = []
 for clip in clip_names:
-    movie_name = {'movie_name': clip_name}
-    oracles.append((UnitOraclesV4() & 'unit_trace_method=3' & movie_name).fetch('unit_oracle'))
+    movie_name = {'movie_name': clip[0]}
+    clip_number = {'clip_number': clip[1]}
+    oracles.append((UnitOraclesV4() & 'unit_trace_method=3' & movie_name & clip_number).fetch('unit_oracle'))
 print(np.shape(oracles))
 
 
