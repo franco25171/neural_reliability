@@ -78,10 +78,12 @@ class PupilOracles(dj.Computed):
     definition = """
     -> ScanIdx
     -> PupilFilterMethod
-    trial_id: int     # trial number
+    trial_idx: int     # trial number
     ---
-    pupil_clip: enum('madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h')
-    pupil_trial: smallint
+    condition_hash: varchar(20) 
+    stimulus_type: varchar(20)
+    movie_name: varchar(20)
+    clip_number: int
     pupil_trace: blob
     pupil_trace_norm: blob
     pupil_trace_diff: blob
@@ -98,654 +100,354 @@ class PupilOracles(dj.Computed):
     
     def _make_tuples(self, key):
         
-        animal_id = (Animal() * Session() * ScanIdx() & key).fetch1('animal_id')
-        session = (Animal() * Session() * ScanIdx() & key).fetch1('session')
-        scan_idx = (Animal() * Session() * ScanIdx() & key).fetch1('scan_idx')
-        scan_key = {'animal_id': animal_id, 'session': session, 'scan_idx': scan_idx}
-        
         # Get oracle info
 
-        stimulus_info = get_stimulus_info(scan_key)
-        clip_hashes = [a[2]['condition_hash'] for a in stimulus_info if a[3]['type'] == 'stimulus.Clip']
+        pupil_stimulus_info = get_pupil_stimulus_info(key)
+        clip_hashes = [i[2]['hash'] for i in pupil_stimulus_info if i[2]['stimulus_type'] == 'stimulus.Clip']
         unique_hashes = np.unique(clip_hashes, return_counts=True)
         oracle_hashes = unique_hashes[0][np.where(unique_hashes[1] > 99)]
+        oracle_hashes_o, clip_names = find_pupil_oracle_hashes_order(pupil_stimulus_info, oracle_hashes) # Get oracle_hashes and movie_names in the order they were presented
         
         # Get pupil info
         
-        pupil_trace = (pupil.FittedPupil.Circle & scan_key).fetch('radius')
-        pupil_times = (pupil.Eye & scan_key).fetch('eye_time')[0]
-        depth_num = np.unique((meso.ScanInfo.Field & scan_key).fetch('z')).shape[0]
-        scan_times = (stimulus.BehaviorSync() & scan_key).fetch1('frame_times')[::depth_num]
+        pupil_trace = (pupil.FittedPupil.Circle & key).fetch('radius')
+        pupil_times = (pupil.Eye & key).fetch('eye_time')[0]
+        depth_num = np.unique((meso.ScanInfo.Field & key).fetch('z')).shape[0]
+        scan_times = (stimulus.BehaviorSync() & key).fetch1('frame_times')[::depth_num]
         
         # Interpolate nan values in pupil signal
         
         nans, x = nan_helper(pupil_trace)
         pupil_trace[nans]= np.interp(x(nans), x(~nans), pupil_trace[~nans])
         
-        # Remove DC from pupil trace
-        pupil_trace = pupil_trace - np.mean(pupil_trace)
+        # DOWNSAMPLE PUPIL TRACE
+        pupil_trace = interpolate(pupil_trace, pupil_times, scan_times)
+       
+        # LOW PASS FILTER & HAMMING WINDOW BAND PASS FILTER REQUIREMENTS
+        order = 5
+        fs = len(pupil_times)/pupil_times[-1]       # sample rate, Hz
+        cutoff = 1  # desired cutoff frequency of the filter, Hz
+        b, a = butter_lowpass(cutoff, fs, order)    # Get the filter coefficients.
+        taps = bandpass_firwin(9, 0.1, 1.0, fs, window='hamming')    # Get filter tapers.
+        
+        # GET PUPIL TRACE SEGMENTS FOR ALL CLIPS
+        # clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
+        
+        #min_trace_len = 10000000
         
         if key['pupil_filter_method'] == 1:
             print(key['pupil_filter_method'])
-
-            # DOWNSAMPLE PUPIL TRACE
-
-            pupil_trace = interpolate(pupil_trace, pupil_times, scan_times)
-
-            # DIFERENTIATE PUPIL TRACE
-
+            
+            # Differentiate pupil trace
             pupil_trace_diff = np.diff(pupil_trace)
+             
+            trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_pupil_segments, all_pupil_segments_norm, all_pupil_segments_diff, all_pupil_segments_diff_norm, all_pupil_oracle, all_pupil_oracle_norm, all_pupil_diff_oracle, all_pupil_diff_oracle_norm = cut_out_pupil_segments(pupil_stimulus_info, clip_names, oracle_hashes_o, pupil_trace, pupil_trace_diff)
 
-            # GET PUPIL TRACE SEGMENTS FOR ALL CLIPS
+            for n in range(len(all_pupil_segments)):
+                key['trial_idx'] = int(trial_idx[n])
+                key['condition_hash'] = condition_hash[n]
+                key['stimulus_type'] = stimulus_type[n]
+                key['movie_name'] = movie_name[n]
+                key['clip_number'] = int(clip_number[n])
 
-            clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-            count = 1
-            for k,stim_hash in zip(clip,oracle_hashes):
+                key['pupil_trace'] = all_pupil_segments[n]
+                key['pupil_trace_norm'] = all_pupil_segments_norm[n]
+                key['pupil_trace_diff'] = all_pupil_segments_diff[n]
+                key['pupil_trace_diff_norm'] = all_pupil_segments_diff_norm[n]
 
-                stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
+                key['pupil_oracle'] = all_pupil_oracle[n]
+                key['pupil_oracle_norm'] = all_pupil_oracle_norm[n]
+                key['pupil_diff_oracle'] = all_pupil_diff_oracle[n]
+                key['pupil_diff_oracle_norm'] = all_pupil_diff_oracle_norm[n]
 
-                pupil_segments = []
-                pupil_segments_norm = []
-                pupil_segments_diff = []
-                pupil_segments_diff_norm = []
-
-                min_trace_len = 10000000
-
-                trial_count = 1
-                for n,(start,stop) in enumerate(stim_start_stop_times):
-
-                    pupil_segments.append(pupil_trace[start:stop])
-                    pupil_segments_norm.append(normalize_signal(pupil_trace[start:stop]))
-                    pupil_segments_diff.append(pupil_trace_diff[start:stop])
-                    pupil_segments_diff_norm.append(normalize_signal(pupil_trace_diff[start:stop]))
-
-                    if min_trace_len > (stop-start):
-                        min_trace_len = stop-start
-
-                for n in range(len(pupil_segments)):
-                    pupil_segments[n] = pupil_segments[n][0:min_trace_len]
-                    pupil_segments_norm[n] = pupil_segments_norm[n][0:min_trace_len]
-                    pupil_segments_diff[n] = pupil_segments_diff[n][0:min_trace_len]
-                    pupil_segments_diff_norm[n] = pupil_segments_diff_norm[n][0:min_trace_len]
-
-                pupil_oracle = calculate_oracle(pupil_segments)
-                pupil_oracle_norm = calculate_oracle(pupil_segments_norm)
-                pupil_diff_oracle = calculate_oracle(pupil_segments_diff)
-                pupil_diff_oracle_norm = calculate_oracle(pupil_segments_diff_norm)
-
-                for n in range(len(pupil_oracle)):
-                    key['trial_id'] = count
-                    key['pupil_trial'] = trial_count
-                    key['pupil_clip'] = k
-
-                    key['pupil_trace'] = pupil_segments[n]
-                    key['pupil_trace_norm'] = pupil_segments_norm[n]
-                    key['pupil_trace_diff'] = pupil_segments_diff[n]
-                    key['pupil_trace_diff_norm'] = pupil_segments_diff_norm[n]
-
-                    key['pupil_oracle'] = pupil_oracle[n]
-                    key['pupil_oracle_norm'] = pupil_oracle_norm[n]
-                    key['pupil_diff_oracle'] = pupil_diff_oracle[n]
-                    key['pupil_diff_oracle_norm'] = pupil_diff_oracle_norm[n]
-
-                    self.insert1(key)
-                    count += 1
-                    trial_count += 1
+                self.insert1(key)
                     
                     
         if key['pupil_filter_method'] == 2:
             print(key['pupil_filter_method'])
-        
-            # FILTER PUPIL TRACE
-
-            # Filter requirements.
-            order = 5
-            fs = len(pupil_times)/pupil_times[-1]       # sample rate, Hz
-            cutoff = 1  # desired cutoff frequency of the filter, Hz
-
-            # Get the filter coefficients.
-            b, a = butter_lowpass(cutoff, fs, order)
-
+       
             # Apply filter
             pupil_trace = scipy.signal.filtfilt(b, a, pupil_trace)
 
-            # DOWNSAMPLE PUPIL TRACE
-
-            pupil_trace = interpolate(pupil_trace, pupil_times, scan_times)
-
-            # DIFERENTIATE PUPIL TRACE
+            # Differentiate pupil trace
 
             pupil_trace_diff = np.diff(pupil_trace)
 
-            # GET PUPIL TRACE SEGMENTS FOR ALL CLIPS
+            trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_pupil_segments, all_pupil_segments_norm, all_pupil_segments_diff, all_pupil_segments_diff_norm, all_pupil_oracle, all_pupil_oracle_norm, all_pupil_diff_oracle, all_pupil_diff_oracle_norm = cut_out_pupil_segments(pupil_stimulus_info, clip_names, oracle_hashes_o, pupil_trace, pupil_trace_diff)
 
-            clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-            count = 1
-            for k,stim_hash in zip(clip,oracle_hashes):
+            for n in range(len(all_pupil_segments)):
+                key['trial_idx'] = int(trial_idx[n])
+                key['condition_hash'] = condition_hash[n]
+                key['stimulus_type'] = stimulus_type[n]
+                key['movie_name'] = movie_name[n]
+                key['clip_number'] = int(clip_number[n])
 
-                stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
+                key['pupil_trace'] = all_pupil_segments[n]
+                key['pupil_trace_norm'] = all_pupil_segments_norm[n]
+                key['pupil_trace_diff'] = all_pupil_segments_diff[n]
+                key['pupil_trace_diff_norm'] = all_pupil_segments_diff_norm[n]
 
-                pupil_segments = []
-                pupil_segments_norm = []
-                pupil_segments_diff = []
-                pupil_segments_diff_norm = []
+                key['pupil_oracle'] = all_pupil_oracle[n]
+                key['pupil_oracle_norm'] = all_pupil_oracle_norm[n]
+                key['pupil_diff_oracle'] = all_pupil_diff_oracle[n]
+                key['pupil_diff_oracle_norm'] = all_pupil_diff_oracle_norm[n]
 
-                min_trace_len = 10000000
-
-                trial_count = 1
-                for n,(start,stop) in enumerate(stim_start_stop_times):
-
-                    pupil_segments.append(pupil_trace[start:stop])
-                    pupil_segments_norm.append(normalize_signal(pupil_trace[start:stop]))
-                    pupil_segments_diff.append(pupil_trace_diff[start:stop])
-                    pupil_segments_diff_norm.append(normalize_signal(pupil_trace_diff[start:stop]))
-
-                    if min_trace_len > (stop-start):
-                        min_trace_len = stop-start
-
-                for n in range(len(pupil_segments)):
-                    pupil_segments[n] = pupil_segments[n][0:min_trace_len]
-                    pupil_segments_norm[n] = pupil_segments_norm[n][0:min_trace_len]
-                    pupil_segments_diff[n] = pupil_segments_diff[n][0:min_trace_len]
-                    pupil_segments_diff_norm[n] = pupil_segments_diff_norm[n][0:min_trace_len]
-
-                pupil_oracle = calculate_oracle(pupil_segments)
-                pupil_oracle_norm = calculate_oracle(pupil_segments_norm)
-                pupil_diff_oracle = calculate_oracle(pupil_segments_diff)
-                pupil_diff_oracle_norm = calculate_oracle(pupil_segments_diff_norm)
-
-                for n in range(len(pupil_oracle)):
-                    key['trial_id'] = count
-                    key['pupil_trial'] = trial_count
-                    key['pupil_clip'] = k
-
-                    key['pupil_trace'] = pupil_segments[n]
-                    key['pupil_trace_norm'] = pupil_segments_norm[n]
-                    key['pupil_trace_diff'] = pupil_segments_diff[n]
-                    key['pupil_trace_diff_norm'] = pupil_segments_diff_norm[n]
-
-                    key['pupil_oracle'] = pupil_oracle[n]
-                    key['pupil_oracle_norm'] = pupil_oracle_norm[n]
-                    key['pupil_diff_oracle'] = pupil_diff_oracle[n]
-                    key['pupil_diff_oracle_norm'] = pupil_diff_oracle_norm[n]
-
-                    self.insert1(key)
-                    count += 1
-                    trial_count += 1
-                    
+                self.insert1(key)
+                   
                     
         if key['pupil_filter_method'] == 3:
             print(key['pupil_filter_method'])
         
-            # FILTER PUPIL TRACE
-
-            # Filter requirements.
-            fs = len(pupil_times)/pupil_times[-1]       # sample rate, Hz
-
-            # Get filter tapers.
-            taps = bandpass_firwin(9, 0.1, 1.0, fs, window='hamming')
-
-            # Apply filter
+            # Apply hamming window band-pass filter
             pupil_trace = scipy.signal.filtfilt(taps, 0.39, pupil_trace)
 
-            # DOWNSAMPLE PUPIL TRACE
-
-            pupil_trace = interpolate(pupil_trace, pupil_times, scan_times)
-
-            # DIFERENTIATE PUPIL TRACE
+            # Differentiate pupil trace
 
             pupil_trace_diff = np.diff(pupil_trace)
 
-            # GET PUPIL TRACE SEGMENTS FOR ALL CLIPS
+            trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_pupil_segments, all_pupil_segments_norm, all_pupil_segments_diff, all_pupil_segments_diff_norm, all_pupil_oracle, all_pupil_oracle_norm, all_pupil_diff_oracle, all_pupil_diff_oracle_norm = cut_out_pupil_segments(pupil_stimulus_info, clip_names, oracle_hashes_o, pupil_trace, pupil_trace_diff)
 
-            clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-            count = 1
-            for k,stim_hash in zip(clip,oracle_hashes):
+            for n in range(len(all_pupil_segments)):
+                key['trial_idx'] = int(trial_idx[n])
+                key['condition_hash'] = condition_hash[n]
+                key['stimulus_type'] = stimulus_type[n]
+                key['movie_name'] = movie_name[n]
+                key['clip_number'] = int(clip_number[n])
 
-                stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
+                key['pupil_trace'] = all_pupil_segments[n]
+                key['pupil_trace_norm'] = all_pupil_segments_norm[n]
+                key['pupil_trace_diff'] = all_pupil_segments_diff[n]
+                key['pupil_trace_diff_norm'] = all_pupil_segments_diff_norm[n]
 
-                pupil_segments = []
-                pupil_segments_norm = []
-                pupil_segments_diff = []
-                pupil_segments_diff_norm = []
+                key['pupil_oracle'] = all_pupil_oracle[n]
+                key['pupil_oracle_norm'] = all_pupil_oracle_norm[n]
+                key['pupil_diff_oracle'] = all_pupil_diff_oracle[n]
+                key['pupil_diff_oracle_norm'] = all_pupil_diff_oracle_norm[n]
 
-                min_trace_len = 10000000
-
-                trial_count = 1
-                for n,(start,stop) in enumerate(stim_start_stop_times):
-
-                    pupil_segments.append(pupil_trace[start:stop])
-                    pupil_segments_norm.append(normalize_signal(pupil_trace[start:stop]))
-                    pupil_segments_diff.append(pupil_trace_diff[start:stop])
-                    pupil_segments_diff_norm.append(normalize_signal(pupil_trace_diff[start:stop]))
-
-                    if min_trace_len > (stop-start):
-                        min_trace_len = stop-start
-
-                for n in range(len(pupil_segments)):
-                    pupil_segments[n] = pupil_segments[n][0:min_trace_len]
-                    pupil_segments_norm[n] = pupil_segments_norm[n][0:min_trace_len]
-                    pupil_segments_diff[n] = pupil_segments_diff[n][0:min_trace_len]
-                    pupil_segments_diff_norm[n] = pupil_segments_diff_norm[n][0:min_trace_len]
-
-                pupil_oracle = calculate_oracle(pupil_segments)
-                pupil_oracle_norm = calculate_oracle(pupil_segments_norm)
-                pupil_diff_oracle = calculate_oracle(pupil_segments_diff)
-                pupil_diff_oracle_norm = calculate_oracle(pupil_segments_diff_norm)
-
-                for n in range(len(pupil_oracle)):
-                    key['trial_id'] = count
-                    key['pupil_trial'] = trial_count
-                    key['pupil_clip'] = k
-
-                    key['pupil_trace'] = pupil_segments[n]
-                    key['pupil_trace_norm'] = pupil_segments_norm[n]
-                    key['pupil_trace_diff'] = pupil_segments_diff[n]
-                    key['pupil_trace_diff_norm'] = pupil_segments_diff_norm[n]
-
-                    key['pupil_oracle'] = pupil_oracle[n]
-                    key['pupil_oracle_norm'] = pupil_oracle_norm[n]
-                    key['pupil_diff_oracle'] = pupil_diff_oracle[n]
-                    key['pupil_diff_oracle_norm'] = pupil_diff_oracle_norm[n]
-
-                    self.insert1(key)
-                    count += 1
-                    trial_count += 1
+                self.insert1(key)
         
         
     
 @schema
-class UnitOracles(dj.Computed):
+class UnitTraces(dj.Computed):
     definition = """
     -> ScanIdx
     -> UnitTraceMethod
-    oracle_id: int
-    ---
     unit_id: int
-    unit_clip: enum('madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h')
-    unit_trial: smallint
+    trial_idx: int
+    --- 
+    condition_hash: varchar(20)
+    stimulus_type: varchar(20)
+    movie_name: varchar(20)
+    clip_number: int
     unit_trace: blob
     unit_trace_norm: blob
+    """
+    
+    @property
+    def key_source(self):
+        return ScanIdx() * UnitTraceMethod()
+    
+    def _make_tuples(self, key):
+        print('Cutting out activity traces for', key)
+        
+        scan_key = (ScanIdx() & key).fetch1('KEY')
+        
+        units_stimulus_info = get_units_stimulus_info(scan_key)
+        
+        # Get oracle info
+
+        clip_hashes = [i[3]['hash'] for i in units_stimulus_info[0] if i[3]['stimulus_type'] == 'stimulus.Clip']
+        unique_hashes = np.unique(clip_hashes, return_counts=True)
+        oracle_hashes = unique_hashes[0][np.where(unique_hashes[1] > 99)]
+        oracle_hashes_o, clip_names = find_oracle_hashes_order(units_stimulus_info, oracle_hashes) # Get oracle_hashes and movie_names in the order they were presented
+        units = [i[0][2]['unit_id'] for i in units_stimulus_info] # Get all units ids
+        
+        min_trace_len = 10000000
+        
+        if key['unit_trace_method'] == 1:
+            print(key['unit_trace_method'])
+
+            for i in range(len(units)):
+                
+                unit_id = {'unit_id': units[i]}
+                print(unit_id)
+                
+                unit_trace = (meso.ScanSet.Unit() * meso.Fluorescence.Trace() & scan_key & unit_id).fetch1('trace')
+
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_unit_traces, all_unit_traces_norm = cut_out_unit_segments(units_stimulus_info, clip_names, oracle_hashes_o, unit_trace, i, units)
+
+                for n in range(len(all_unit_traces)):
+
+                    key['unit_id'] = (units[i])
+                    key['trial_idx'] = int(trial_idx[n])
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = int(clip_number[n])
+                    key['unit_trace'] = all_unit_traces[n]
+                    key['unit_trace_norm'] = all_unit_traces_norm[n]
+                    self.insert1(key)
+                        
+        if key['unit_trace_method'] == 2:
+            print(key['unit_trace_method'])
+            unit_count_m1 = 1
+
+            for i in range(len(units)):
+                
+                unit_id = {'unit_id': units[i]}
+                print(unit_id)
+
+                unit_trace = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
+
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_unit_traces, all_unit_traces_norm = cut_out_unit_segments(units_stimulus_info, clip_names, oracle_hashes_o, unit_trace, i, units)
+
+                for n in range(len(all_unit_traces)):
+
+                    key['unit_id'] = int(units[i])
+                    key['trial_idx'] = trial_idx[n]
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = clip_number[n]
+                    key['unit_trace'] = all_unit_traces[n]
+                    key['unit_trace_norm'] = all_unit_traces_norm[n]
+                    self.insert1(key)
+
+                        
+        if key['unit_trace_method'] == 3:
+            print(key['unit_trace_method'])
+            unit_count_m1 = 1
+
+            for i in range(len(units)):
+                
+                unit_id = {'unit_id': units[i]}
+                print(unit_id)
+
+                unit_trace = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
+                unit_trace = abs(savgol_filter(unit_trace, 5, 2))
+
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_unit_traces, all_unit_traces_norm = cut_out_unit_segments(units_stimulus_info, clip_names, oracle_hashes_o, unit_trace, i, units)
+                             
+                for n in range(len(all_unit_traces)):
+
+                    key['unit_id'] = int(units[i])
+                    key['trial_idx'] = trial_idx[n]
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = clip_number[n]
+                    key['unit_trace'] = all_unit_traces[n]
+                    key['unit_trace_norm'] = all_unit_traces_norm[n]
+                    self.insert1(key)
+                    
+                    
+@schema
+class UnitOracles(dj.Computed):
+    definition = """
+    -> UnitTraces
+    unit_id: int
+    trial_idx: int
+    --- 
+    condition_hash: varchar(20)
+    stimulus_type: varchar(20)
+    movie_name: varchar(20)
+    clip_number: int
     unit_oracle              : float
     unit_oracle_norm         : float
     """
     
-    @property
-    def key_source(self):
-        return ScanIdx() * UnitTraceMethod()
-    
     def _make_tuples(self, key):
         print('Cutting out activity traces for', key)
         
-        animal_id = (Animal() * Session() * ScanIdx() & key).fetch1('animal_id')
-        session = (Animal() * Session() * ScanIdx() & key).fetch1('session')
-        scan_idx = (Animal() * Session() * ScanIdx() & key).fetch1('scan_idx')
-        scan_key = {'animal_id': animal_id, 'session': session, 'scan_idx': scan_idx}
+        scan_key = (ScanIdx() & key).fetch1('KEY')
         
-        units = np.unique((meso.Activity.Trace & scan_key).fetch('unit_id'))
+        units_stimulus_info = get_units_stimulus_info(scan_key)
         
         # Get oracle info
 
-        stimulus_info = get_stimulus_info(scan_key)
-        clip_hashes = [a[2]['condition_hash'] for a in stimulus_info if a[3]['type'] == 'stimulus.Clip']
+        clip_hashes = [i[3]['hash'] for i in units_stimulus_info[0] if i[3]['stimulus_type'] == 'stimulus.Clip']
         unique_hashes = np.unique(clip_hashes, return_counts=True)
         oracle_hashes = unique_hashes[0][np.where(unique_hashes[1] > 99)]
-        
+        oracle_hashes_o, clip_names = find_oracle_hashes_order(units_stimulus_info, oracle_hashes) # Get oracle_hashes and movie_names in the order they were presented
+        units = [i[0][2]['unit_id'] for i in units_stimulus_info] # Get all units ids
         
         if key['unit_trace_method'] == 1:
             print(key['unit_trace_method'])
-            unit_count_m1 = 1
+            unit_trace_method = key['unit_trace_method']
 
-            for unit in units:
+            for i in range(len(units)):
                 
-                unit_id = {'unit_id': unit}
+                unit_id = {'unit_id': units[i]}
                 print(unit_id)
+                
+                #unit_trace = (meso.ScanSet.Unit() * meso.Fluorescence.Trace() & scan_key & unit_id).fetch1('trace')
 
-                fluorescence_trace = (meso.ScanSet.Unit() * meso.Fluorescence.Trace() & scan_key & unit_id).fetch1('trace')
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_oracles, all_oracles_norm = calculate_unit_oracles(units_stimulus_info, clip_names, oracle_hashes_o, i, units, unit_id, unit_trace_method)
 
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
+                for n in range(len(all_oracles)):
 
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
-
-                    count_m1 = 1
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(fluorescence_trace[start:stop])
-                        unit_traces_norm.append(normalize_signal(fluorescence_trace[start:stop]))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-
-                    oracle = calculate_oracle(unit_traces)
-                    oracle_norm = calculate_oracle(unit_traces_norm)
-
-                    for n in range(len(oracle)):
-                        
-                        key['oracle_id'] = unit_count_m1
-                        key['unit_id'] = int(unit)
-                        key['unit_clip'] = k
-                        key['unit_trial'] = count_m1
-                        key['unit_trace'] = unit_traces[n]
-                        key['unit_trace_norm'] = unit_traces_norm[n]
-                        key['unit_oracle'] = oracle[n]
-                        key['unit_oracle_norm'] = oracle_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
+                    key['unit_id'] = (units[i])
+                    key['trial_idx'] = int(trial_idx[n])
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = int(clip_number[n])
+                    key['unit_oracle'] = all_oracles[n]
+                    key['unit_oracle_norm'] = all_oracles_norm[n]
+                    self.insert1(key)
                         
         if key['unit_trace_method'] == 2:
             print(key['unit_trace_method'])
-            unit_count_m1 = 1
+            unit_trace_method = key['unit_trace_method']
 
-            for unit in units:
+            for i in range(len(units)):
                 
-                unit_id = {'unit_id': unit}
+                unit_id = {'unit_id': units[i]}
                 print(unit_id)
 
-                signal = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
+                #unit_trace = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
 
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_oracles, all_oracles_norm = calculate_unit_oracles(units_stimulus_info, clip_names, oracle_hashes_o, i, units, unit_id, unit_trace_method)
 
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
+                for n in range(len(all_oracles)):
 
-                    count_m1 = 1
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(signal[start:stop])
-                        unit_traces_norm.append(normalize_signal(signal[start:stop]))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-
-                    oracle = calculate_oracle(unit_traces)
-                    oracle_norm = calculate_oracle(unit_traces_norm)
-
-                    for n in range(len(oracle)):
-                        
-                        key['oracle_id'] = unit_count_m1
-                        key['unit_id'] = int(unit)
-                        key['unit_clip'] = k
-                        key['unit_trial'] = count_m1
-                        key['unit_trace'] = unit_traces[n]
-                        key['unit_trace_norm'] = unit_traces_norm[n]
-                        key['unit_oracle'] = oracle[n]
-                        key['unit_oracle_norm'] = oracle_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
+                    key['unit_id'] = int(units[i])
+                    key['trial_idx'] = trial_idx[n]
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = clip_number[n]
+                    key['unit_oracle'] = all_oracles[n]
+                    key['unit_oracle_norm'] = all_oracles_norm[n]
+                    self.insert1(key)
 
                         
         if key['unit_trace_method'] == 3:
             print(key['unit_trace_method'])
-            unit_count_m1 = 1
+            unit_trace_method = key['unit_trace_method']
 
-            for unit in units:
+            for i in range(len(units)):
                 
-                unit_id = {'unit_id': unit}
+                unit_id = {'unit_id': units[i]}
                 print(unit_id)
 
-                signal = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
+                #unit_trace = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
+                #unit_trace = abs(savgol_filter(unit_trace, 5, 2))
 
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
+                trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_oracles, all_oracles_norm = calculate_unit_oracles(units_stimulus_info, clip_names, oracle_hashes_o, i, units, unit_id, unit_trace_method)
+                             
+                for n in range(len(all_oracles)):
 
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
-
-                    count_m1 = 1
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(abs(savgol_filter(signal[start:stop],5,2)))
-                        unit_traces_norm.append(normalize_signal(abs(savgol_filter(signal[start:stop],5,2))))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-
-                    oracle = calculate_oracle(unit_traces)
-                    oracle_norm = calculate_oracle(unit_traces_norm)
-
-                    for n in range(len(oracle)):
-                        
-                        key['oracle_id'] = unit_count_m1
-                        key['unit_id'] = int(unit)
-                        key['unit_clip'] = k
-                        key['unit_trial'] = count_m1
-                        key['unit_trace'] = unit_traces[n]
-                        key['unit_trace_norm'] = unit_traces_norm[n]
-                        key['unit_oracle'] = oracle[n]
-                        key['unit_oracle_norm'] = oracle_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
-
-                        
-@schema
-class UnitOraclesSlidingWindow(dj.Computed):
-    definition = """
-    -> ScanIdx
-    -> UnitTraceMethod
-    unit_oracles_id: int
-    ---
-    unit_id: int
-    unit_clip: enum('madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h')
-    window: smallint
-    sliding_oracles              : float
-    sliding_oracles_norm         : float
-    """
-    
-    @property
-    def key_source(self):
-        return ScanIdx() * UnitTraceMethod()
-    
-    def _make_tuples(self, key):
-        print('Cutting out activity traces for', key)
-        
-        animal_id = (Animal() * Session() * ScanIdx() & key).fetch1('animal_id')
-        session = (Animal() * Session() * ScanIdx() & key).fetch1('session')
-        scan_idx = (Animal() * Session() * ScanIdx() & key).fetch1('scan_idx')
-        scan_key = {'animal_id': animal_id, 'session': session, 'scan_idx': scan_idx}
-        
-        units = np.unique((meso.Activity.Trace & scan_key).fetch('unit_id'))
-        
-        # Get oracle info
-
-        stimulus_info = get_stimulus_info(scan_key)
-        clip_hashes = [a[2]['condition_hash'] for a in stimulus_info if a[3]['type'] == 'stimulus.Clip']
-        unique_hashes = np.unique(clip_hashes, return_counts=True)
-        oracle_hashes = unique_hashes[0][np.where(unique_hashes[1] > 99)]
-        
-        
-        if key['unit_trace_method'] == 1:
-            print(key['unit_trace_method'])
-            unit_count_m1 = 1
-            
-            sliding_window = 10
-            step = 1
-            
-            for unit in units:
-                
-                unit_id = {'unit_id': unit}
-                print(unit_id)
-
-                fluorescence_trace = (meso.ScanSet.Unit() * meso.Fluorescence.Trace() & scan_key & unit_id).fetch1('trace')
-
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
-
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(fluorescence_trace[start:stop])
-                        unit_traces_norm.append(normalize_signal(fluorescence_trace[start:stop]))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-                    
-                    start_frame = 0
-                    n = len(unit_traces)
-                    num_windows = n - sliding_window + 1
-
-                    sliding_oracles = []
-                    sliding_oracles_norm = []
-                    count_m1 = 1
-                    for j in range(num_windows): 
-                        sliding_oracles.append(np.nanmean(calculate_oracle(unit_traces[start_frame : start_frame + sliding_window])))
-                        sliding_oracles_norm.append(np.nanmean(calculate_oracle(unit_traces_norm[start_frame : start_frame + sliding_window])))
-                        start_frame += step
-                        
-                    for n in range(len(sliding_oracles)):
-                        
-                        key['unit_oracles_id'] = unit_count_m1
-                        key['unit_id'] = unit
-                        key['unit_clip'] = k
-                        key['window'] = count_m1
-                        key['sliding_oracles'] = sliding_oracles[n]
-                        key['sliding_oracles_norm'] = sliding_oracles_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
-                        
-                        
-        if key['unit_trace_method'] == 2:
-            print(key['unit_trace_method'])
-            unit_count_m1 = 1
-            
-            sliding_window = 10
-            step = 1
-            
-            for unit in units:
-                
-                unit_id = {'unit_id': unit}
-                print(unit_id)
-
-                signal = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
-
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
-
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(signal[start:stop])
-                        unit_traces_norm.append(normalize_signal(signal[start:stop]))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-                    
-                    start_frame = 0
-                    n = len(unit_traces)
-                    num_windows = n - sliding_window + 1
-
-                    sliding_oracles = []
-                    sliding_oracles_norm = []
-                    count_m1 = 1
-                    for j in range(num_windows): 
-                        sliding_oracles.append(np.nanmean(calculate_oracle(unit_traces[start_frame : start_frame + sliding_window])))
-                        sliding_oracles_norm.append(np.nanmean(calculate_oracle(unit_traces_norm[start_frame : start_frame + sliding_window])))
-                        start_frame += step
-                        
-                    for n in range(len(sliding_oracles)):
-                        
-                        key['unit_oracles_id'] = unit_count_m1
-                        key['unit_id'] = unit
-                        key['unit_clip'] = k
-                        key['window'] = count_m1
-                        key['sliding_oracles'] = sliding_oracles[n]
-                        key['sliding_oracles_norm'] = sliding_oracles_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
-                        
-                        
-        if key['unit_trace_method'] == 3:
-            print(key['unit_trace_method'])
-            unit_count_m1 = 1
-            
-            sliding_window = 10
-            step = 1
-            
-            for unit in units:
-                
-                unit_id = {'unit_id': unit}
-                print(unit_id)
-
-                signal = (meso.Activity.Trace & scan_key & unit_id).fetch1('trace')
-
-                oracles_per_clip = []
-                traces_per_clip = []
-                clip = ['madmax', 'starwars', 'finalrun', 'bigrun', 'sports1m_ui', 'sports1m_7h']
-
-                for k,stim_hash in zip(clip,oracle_hashes):
-                    stim_start_stop_times = [(a[0],a[1]) for a in stimulus_info if a[2]['condition_hash'] == stim_hash]
-                    unit_traces = []
-                    unit_traces_norm = []
-                    min_trace_len = 10000000
-
-                    for n,(start,stop) in enumerate(stim_start_stop_times):
-                        unit_traces.append(abs(savgol_filter(signal[start:stop],5,2)))
-                        unit_traces_norm.append(normalize_signal(abs(savgol_filter(signal[start:stop],5,2))))
-                        if min_trace_len > (stop-start):
-                            min_trace_len = stop-start
-                    for n in range(len(unit_traces)):
-                        unit_traces[n] = unit_traces[n][0:min_trace_len]
-                        unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
-                    
-                    start_frame = 0
-                    n = len(unit_traces)
-                    num_windows = n - sliding_window + 1
-
-                    sliding_oracles = []
-                    sliding_oracles_norm = []
-                    count_m1 = 1
-                    for j in range(num_windows): 
-                        sliding_oracles.append(np.nanmean(calculate_oracle(unit_traces[start_frame : start_frame + sliding_window])))
-                        sliding_oracles_norm.append(np.nanmean(calculate_oracle(unit_traces_norm[start_frame : start_frame + sliding_window])))
-                        start_frame += step
-                        
-                    for n in range(len(sliding_oracles)):
-                        
-                        key['unit_oracles_id'] = unit_count_m1
-                        key['unit_id'] = unit
-                        key['unit_clip'] = k
-                        key['window'] = count_m1
-                        key['sliding_oracles'] = sliding_oracles[n]
-                        key['sliding_oracles_norm'] = sliding_oracles_norm[n]
-                        self.insert1(key)
-                        count_m1 += 1
-                        unit_count_m1 += 1
+                    key['unit_id'] = int(units[i])
+                    key['trial_idx'] = trial_idx[n]
+                    key['condition_hash'] = condition_hash[n]
+                    key['stimulus_type'] = stimulus_type[n]
+                    key['movie_name'] = movie_name[n]
+                    key['clip_number'] = clip_number[n]
+                    key['unit_oracle'] = all_oracles[n]
+                    key['unit_oracle_norm'] = all_oracles_norm[n]
+                    self.insert1(key)
                         
                         
              
@@ -836,3 +538,286 @@ def bandpass_firwin(ntaps, lowcut, highcut, fs, window='hamming'):
     taps = firwin(ntaps, [lowcut, highcut], nyq=nyq, pass_zero=False,
                   window=window, scale=False)
     return taps
+
+def get_pupil_stimulus_info(key):
+    
+    if np.unique((stimulus.Trial & key).fetch('trial_idx')).shape[0] != len(stimulus.Trial & key):
+        raise PipelineException("Error: Duplicate trial indices detected. Is the key unique for one scan?") 
+    
+    # Get stimulus information for all trials
+
+    all_trials, all_hashes, all_flips, all_conditions, all_movie_names, all_clip_numbers = ((stimulus.Trial * 
+                                                                                             stimulus.Condition * 
+                                                                                             stimulus.Clip & key).fetch('trial_idx',
+                                                                                                                             'condition_hash',
+                                                                                                                             'flip_times',
+                                                                                                                             'stimulus_type',
+                                                                                                                             'movie_name',
+                                                                                                                             'clip_number',
+                                                                                                                             order_by='last_flip ASC'))
+    trial_information = []
+    for trial, hashes, trial_condition, movie_name, clip_number in zip(all_trials, all_hashes, all_conditions, all_movie_names, all_clip_numbers):
+
+        if trial_condition == 'stimulus.Monet2':
+            fps, duration, version = ((stimulus.Trial & trial_key) * stimulus.Condition * stimulus.Monet2).fetch1('fps', 'duration', 'stimulus_version')
+            extra_info = {'type': trial_condition, 'fps': fps, 'duration': duration, 'version': version}
+        elif trial_condition == 'stimulus.Trippy':
+            fps, duration, version = ((stimulus.Trial & trial_key) * stimulus.Condition * stimulus.Trippy).fetch1('fps', 'duration', 'stimulus_version')
+            extra_info = {'type': trial_condition, 'fps': fps, 'duration': duration, 'version': version}
+        elif trial_condition == 'stimulus.Clip':
+            extra_info = {'trial_id': trial, 'hash': hashes, 'stimulus_type': trial_condition, 'movie_name': movie_name, 'clip_number': clip_number}
+
+            trial_information.append(extra_info)
+
+    # determine field offset for ScanImage frame times
+    all_z = (meso.ScanInfo.Field & key).fetch('z', order_by='field ASC')
+
+    # Number of depths recorded from during scan
+    slice_num = len(all_z)
+
+    frame_times = (stimulus.Sync & key).fetch1('frame_times')
+    field_offset = 0
+    frame_times = frame_times[field_offset::slice_num] # Sliced ScanImage times for a single depth of interest
+    start_idx = []
+    end_idx = []
+    pupil_stimulus_info = []
+    for j in range(len(all_flips)):
+        trial_flips = all_flips[j]
+        start_idx.append((frame_times < trial_flips.squeeze()[0]).sum()) 
+        end_idx.append((frame_times < trial_flips.squeeze()[-1]).sum())
+        pupil_stimulus_info.append([start_idx[j], end_idx[j], trial_information[j]])
+        
+    return pupil_stimulus_info
+
+def get_units_stimulus_info(key):
+    
+    if np.unique((stimulus.Trial & key).fetch('trial_idx')).shape[0] != len(stimulus.Trial & key):
+        raise PipelineException("Error: Duplicate trial indices detected. Is the key unique for one scan?") 
+    
+    # Get stimulus information for all trials
+
+    all_trials, all_hashes, all_flips, all_conditions, all_movie_names, all_clip_numbers = ((stimulus.Trial * 
+                                                                                             stimulus.Condition * 
+                                                                                             stimulus.Clip & key).fetch('trial_idx',
+                                                                                                                             'condition_hash',
+                                                                                                                             'flip_times',
+                                                                                                                             'stimulus_type',
+                                                                                                                             'movie_name',
+                                                                                                                             'clip_number',
+                                                                                                                             order_by='last_flip ASC'))
+    trial_information = []
+    for trial, hashes, trial_condition, movie_name, clip_number in zip(all_trials, all_hashes, all_conditions, all_movie_names, all_clip_numbers):
+
+        if trial_condition == 'stimulus.Monet2':
+            fps, duration, version = ((stimulus.Trial & trial_key) * stimulus.Condition * stimulus.Monet2).fetch1('fps', 'duration', 'stimulus_version')
+            extra_info = {'type': trial_condition, 'fps': fps, 'duration': duration, 'version': version}
+        elif trial_condition == 'stimulus.Trippy':
+            fps, duration, version = ((stimulus.Trial & trial_key) * stimulus.Condition * stimulus.Trippy).fetch1('fps', 'duration', 'stimulus_version')
+            extra_info = {'type': trial_condition, 'fps': fps, 'duration': duration, 'version': version}
+        elif trial_condition == 'stimulus.Clip':
+            extra_info = {'trial_id': trial, 'hash': hashes, 'stimulus_type': trial_condition, 'movie_name': movie_name, 'clip_number': clip_number}
+
+            trial_information.append(extra_info)
+
+    # determine field offset for ScanImage frame times
+    all_z = (meso.ScanInfo.Field & key).fetch('z', order_by='field ASC')
+
+    # Number of depths recorded from during scan
+    slice_num = len(all_z)
+
+    # Get keys from all units
+    unit_keys, fields, ms_delays, field_z = (meso.ScanSet.UnitInfo * meso.Activity.Trace() * meso.ScanInfo.Field & key).fetch('KEY', 'field', 'ms_delay', 'z', order_by='unit_id ASC')
+    frame_times = (stimulus.Sync & key).fetch1('frame_times')
+    units_stimulus_info = []
+    for i in range(5):#len(unit_keys)):
+        print(i)   
+        field_offset = np.where(all_z == field_z[i])[0][0]
+        frame_times_wdelay = frame_times + ms_delays[i]/1000 # ScanImage times on stimulus clock
+        frame_times_wdelay = frame_times_wdelay[field_offset::slice_num] # Sliced ScanImage times for a single depth of interest
+        start_idx = []
+        end_idx = []
+        trial_info = []
+        for j in range(len(all_flips)):
+            trial_flips = all_flips[j]
+            start_idx.append((frame_times_wdelay < trial_flips.squeeze()[0]).sum()) 
+            end_idx.append((frame_times_wdelay < trial_flips.squeeze()[-1]).sum())
+            trial_info.append([start_idx[j], end_idx[j], {'unit_id': unit_keys[i]['unit_id']}, trial_information[j]])
+        units_stimulus_info.append(trial_info)
+        
+    return units_stimulus_info
+
+
+def find_pupil_oracle_hashes_order(pupil_stimulus_info, oracle_hashes):
+
+    clip_names = []
+    for i in pupil_stimulus_info:
+        clip_names.append([[i[0],i[1],i[2]['hash'],i[2]['movie_name'],i[2]['clip_number']] 
+                           for clip_hash in oracle_hashes if i[2]['hash'] == clip_hash])
+
+    clip_names = [i for i in clip_names if i]
+    clip_names = np.squeeze(clip_names[0:len(oracle_hashes)])
+
+    oracle_hashes_o = [i[2] for i in clip_names]
+    movie_names = [i[3]+'_'+i[4] for i in clip_names]
+    
+    return oracle_hashes_o, movie_names
+
+
+def find_oracle_hashes_order(units_stimulus_info, oracle_hashes):
+
+    clip_names = []
+    for i in units_stimulus_info[0]:
+        clip_names.append([[i[0],i[1],i[3]['hash'],i[3]['movie_name'],i[3]['clip_number']] 
+                           for clip_hash in oracle_hashes if i[3]['hash'] == clip_hash])
+
+    clip_names = [i for i in clip_names if i]
+    clip_names = np.squeeze(clip_names[0:len(oracle_hashes)])
+
+    oracle_hashes_o = [i[2] for i in clip_names]
+    movie_names = [i[3]+'_'+i[4] for i in clip_names]
+    
+    return oracle_hashes_o, movie_names
+
+
+def cut_out_pupil_segments(pupil_stimulus_info, clip_names, oracle_hashes_o, pupil_trace, pupil_trace_diff):
+    
+    all_pupil_segments = [0] * len(pupil_stimulus_info)
+    all_pupil_segments_norm = [0] * len(pupil_stimulus_info)
+    all_pupil_segments_diff = [0] * len(pupil_stimulus_info)
+    all_pupil_segments_diff_norm = [0] * len(pupil_stimulus_info)
+    all_pupil_oracle = [0] * len(pupil_stimulus_info)
+    all_pupil_oracle_norm = [0] * len(pupil_stimulus_info)
+    all_pupil_diff_oracle = [0] * len(pupil_stimulus_info)
+    all_pupil_diff_oracle_norm = [0] * len(pupil_stimulus_info)
+    trial_idx = [0] * len(pupil_stimulus_info)
+    condition_hash = [0] * len(pupil_stimulus_info)
+    stimulus_type = [0] * len(pupil_stimulus_info)
+    movie_name = [0] * len(pupil_stimulus_info)
+    clip_number = [0] * len(pupil_stimulus_info)
+    for clip,stim_hash in zip(clip_names,oracle_hashes_o):
+        stim_start_stop_times = [(a[0],a[1],a[2]['trial_id'],a[2]['hash'],a[2]['stimulus_type'],
+                                  a[2]['movie_name'],a[2]['clip_number']) for a in 
+                                 pupil_stimulus_info if a[2]['hash'] == stim_hash]
+
+        pupil_segments = []
+        pupil_segments_norm = []
+        pupil_segments_diff = []
+        pupil_segments_diff_norm = []
+        min_trace_len = 10000000
+
+        for n,(start,stop,index,condition,stype,mname,cnumber) in enumerate(stim_start_stop_times):
+
+            pupil_segments.append(pupil_trace[start:stop])
+            pupil_segments_norm.append(normalize_signal(pupil_trace[start:stop]))
+            pupil_segments_diff.append(pupil_trace_diff[start:stop])
+            pupil_segments_diff_norm.append(normalize_signal(pupil_trace_diff[start:stop]))
+
+            if min_trace_len > (stop-start):
+                min_trace_len = stop-start
+
+        for n in range(len(pupil_segments)):
+            pupil_segments[n] = pupil_segments[n][0:min_trace_len]
+            pupil_segments_norm[n] = pupil_segments_norm[n][0:min_trace_len]
+            pupil_segments_diff[n] = pupil_segments_diff[n][0:min_trace_len]
+            pupil_segments_diff_norm[n] = pupil_segments_diff_norm[n][0:min_trace_len]
+            
+            all_pupil_segments[stim_start_stop_times[n][2]] = pupil_segments[n]
+            all_pupil_segments_norm[stim_start_stop_times[n][2]] = pupil_segments_norm[n]
+            all_pupil_segments_diff[stim_start_stop_times[n][2]] = pupil_segments_diff[n]
+            all_pupil_segments_diff_norm[stim_start_stop_times[n][2]] = pupil_segments_diff_norm[n]
+            trial_idx[stim_start_stop_times[n][2]] = stim_start_stop_times[n][2] 
+            condition_hash[stim_start_stop_times[n][2]] = stim_start_stop_times[n][3]
+            stimulus_type[stim_start_stop_times[n][2]] = stim_start_stop_times[n][4]
+            movie_name[stim_start_stop_times[n][2]] = stim_start_stop_times[n][5]
+            clip_number[stim_start_stop_times[n][2]] = stim_start_stop_times[n][6]
+
+        pupil_oracle = calculate_oracle(pupil_segments)
+        pupil_oracle_norm = calculate_oracle(pupil_segments_norm)
+        pupil_diff_oracle = calculate_oracle(pupil_segments_diff)
+        pupil_diff_oracle_norm = calculate_oracle(pupil_segments_diff_norm)
+        
+        for n in range(len(pupil_segments)):
+            all_pupil_oracle[stim_start_stop_times[n][2]] = pupil_oracle[n]
+            all_pupil_oracle_norm[stim_start_stop_times[n][2]] = pupil_oracle_norm[n]
+            all_pupil_diff_oracle[stim_start_stop_times[n][2]] = pupil_diff_oracle[n]
+            all_pupil_diff_oracle_norm[stim_start_stop_times[n][2]] = pupil_diff_oracle_norm[n]
+            
+    return trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_pupil_segments, all_pupil_segments_norm, all_pupil_segments_diff, all_pupil_segments_diff_norm, all_pupil_oracle, all_pupil_oracle_norm, all_pupil_diff_oracle, all_pupil_diff_oracle_norm  
+            
+            
+def cut_out_unit_segments(units_stimulus_info, clip_names, oracle_hashes_o, unit_trace, i, units):
+                                        
+    all_unit_traces = [0] * len(units_stimulus_info[0])
+    all_unit_traces_norm = [0] * len(units_stimulus_info[0])
+    trial_idx = [0] * len(units_stimulus_info[0])
+    condition_hash = [0] * len(units_stimulus_info[0])
+    stimulus_type = [0] * len(units_stimulus_info[0])
+    movie_name = [0] * len(units_stimulus_info[0])
+    clip_number = [0] * len(units_stimulus_info[0])
+    for clip,stim_hash in zip(clip_names,oracle_hashes_o):
+        stim_start_stop_times = [(a[0],a[1],a[3]['trial_id'],a[3]['hash'],a[3]['stimulus_type'],
+                                  a[3]['movie_name'],a[3]['clip_number']) for a in 
+                                 units_stimulus_info[i] if a[2]['unit_id'] == units[i] and a[3]['hash'] == stim_hash]
+        unit_traces = []
+        unit_traces_norm = []
+        min_trace_len = 10000000
+
+        for n,(start,stop,index,condition,stype,mname,cnumber) in enumerate(stim_start_stop_times):
+            unit_traces.append(unit_trace[start:stop])
+            unit_traces_norm.append(normalize_signal(unit_trace[start:stop]))
+            if min_trace_len > (stop-start):
+                min_trace_len = stop-start
+        for n in range(len(unit_traces)):
+            unit_traces[n] = unit_traces[n][0:min_trace_len]
+            unit_traces_norm[n] = unit_traces_norm[n][0:min_trace_len]
+            all_unit_traces[stim_start_stop_times[n][2]] = unit_traces[n]
+            all_unit_traces_norm[stim_start_stop_times[n][2]] = unit_traces_norm[n]
+            trial_idx[stim_start_stop_times[n][2]] = stim_start_stop_times[n][2] 
+            condition_hash[stim_start_stop_times[n][2]] = stim_start_stop_times[n][3]
+            stimulus_type[stim_start_stop_times[n][2]] = stim_start_stop_times[n][4]
+            movie_name[stim_start_stop_times[n][2]] = stim_start_stop_times[n][5]
+            clip_number[stim_start_stop_times[n][2]] = stim_start_stop_times[n][6]
+            
+    return trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_unit_traces, all_unit_traces_norm
+
+def calculate_unit_oracles(units_stimulus_info, clip_names, oracle_hashes_o, i, units, unit_id, unit_trace_method):
+                                        
+    all_oracles = [0] * len(units_stimulus_info[0])
+    all_oracles_norm = [0] * len(units_stimulus_info[0])
+    trial_idx = [0] * len(units_stimulus_info[0])
+    condition_hash = [0] * len(units_stimulus_info[0])
+    stimulus_type = [0] * len(units_stimulus_info[0])
+    movie_name = [0] * len(units_stimulus_info[0])
+    clip_number = [0] * len(units_stimulus_info[0])
+
+    for clip,stim_hash in zip(clip_names,oracle_hashes_o):
+        stim_start_stop_times = [(a[3]['trial_id'],a[3]['hash'],a[3]['stimulus_type'],
+                                  a[3]['movie_name'],a[3]['clip_number']) for a in 
+                                 units_stimulus_info[i] if a[2]['unit_id'] == units[i] and a[3]['hash'] == stim_hash]
+
+        condition_hash_ = {'condition_hash': stim_hash}
+        unit_trace_method_ = {'unit_trace_method': unit_trace_method}
+        unit_traces = (UnitTraces() & unit_trace_method_ & unit_id & condition_hash_).fetch('unit_trace')
+        unit_traces_norm = (UnitTraces() & unit_trace_method_ & unit_id & condition_hash_).fetch('unit_trace_norm')
+
+        for n in range(len(unit_traces)):
+            trial_idx[stim_start_stop_times[n][0]] = stim_start_stop_times[n][0] 
+            condition_hash[stim_start_stop_times[n][0]] = stim_start_stop_times[n][1]
+            stimulus_type[stim_start_stop_times[n][0]] = stim_start_stop_times[n][2]
+            movie_name[stim_start_stop_times[n][0]] = stim_start_stop_times[n][3]
+            clip_number[stim_start_stop_times[n][0]] = stim_start_stop_times[n][4]
+            
+        unit_traces_ = []
+        unit_traces_norm_ = []
+        for n in range(len(unit_traces)):
+            unit_traces_.append(unit_traces[n])
+            unit_traces_norm_.append(unit_traces_norm[n])
+
+        oracle = calculate_oracle(unit_traces_)
+        oracle_norm = calculate_oracle(unit_traces_norm_)
+
+        for n in range(len(unit_traces)):
+            all_oracles[stim_start_stop_times[n][0]] = oracle[n]
+            all_oracles_norm[stim_start_stop_times[n][0]] = oracle_norm[n]
+            
+    return trial_idx, condition_hash, stimulus_type, movie_name, clip_number, all_oracles, all_oracles_norm
