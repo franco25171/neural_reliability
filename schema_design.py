@@ -1,7 +1,7 @@
 import datajoint as dj
 import numpy as np
-from pipeline import pupil, meso, treadmill
-from stimulus import stimulus
+from pipeline import pupil, meso, treadmill, experiment
+#from stimulus import stimulus
 from stimulus.utils import get_stimulus_info
 from scipy.interpolate import interp1d
 from scipy.signal import butter, lfilter
@@ -12,40 +12,14 @@ import math
 import scipy
 from scipy.signal import savgol_filter
 from scipy.signal import firwin
+stimulus = dj.create_virtual_module('stim', 'pipeline_stimulus')
 
-schema = dj.schema('franco_100_trials', locals())
-
-@schema 
-class Animal(dj.Manual):
-    definition = """
-    animal_id : int # animal id assigned by the lab 
-    ---
-   
-    """
-    
-@schema 
-class Session(dj.Manual):
-    definition = """
-    # Experiment Session
-    -> Animal
-    session: smallint # session number for the animal
-    ---
- 
-    """
-    
-@schema 
-class ScanIdx(dj.Manual):
-    definition = """
-    # Two-photon imaging scan
-    -> Session
-    scan_idx: smallint # scan number within the session
-    ---
-    """
+schema = dj.schema('franco_100_trials')
 
 @schema
 class PupilFilterMethod(dj.Lookup):
     definition = """
-    # Variants in unit traces
+    # Variants in pupil traces
     pupil_filter_method               : tinyint              # method index
     ---
     description              : varchar(250)         # description of method
@@ -69,91 +43,81 @@ class UnitTraceMethod(dj.Lookup):
                {'unit_trace_method':2, 'description':"deconvolved fluorescence trace"},
                {'unit_trace_method':3, 'description':"deconvolved smoothed fluorescence trace using a sgolay filter"}]
     
+@schema
+class UnitOracleMethod(dj.Lookup):
+    definition = """
+    # Variants in how unit oracle is calculated 
+    unit_oracle_method               : tinyint              # method index
+    ---
+    description              : varchar(250)         # description of method
+    """
+
+    contents = [{'unit_oracle_method':1, 'description':"oracle is calculated for every trial correlating a particular trial with the mean of the rest of the trials (leave one out)"}]
+    
+@schema
+class PupilOracleMethod(dj.Lookup):
+    definition = """
+    # Variants in how pupil oracle is calculated
+    pupil_oracle_method               : tinyint              # method index
+    ---
+    description              : varchar(250)         # description of method
+    """
+
+    contents = [{'pupil_oracle_method':1, 'description':"oracle is calculated for every trial correlating a particular trial with the mean of the rest of the trials (leave one out)"}]
+
+@schema 
+class OracleScans(dj.Computed):
+    definition = """
+    -> experiment.Scan
+    ---
+    """
+    
 @schema 
 class TrialInfo(dj.Computed):
     definition = """
-    -> ScanIdx
-    trial_idx: int
+    -> stimulus.Trial
     ---
-    condition_hash: varchar(20)
-    flip_times: blob
-    stimulus_type: varchar(20)
-    movie_name: varchar(20)
-    clip_number: int
     """
-    
-    def _make_tuples(self, key):
-        
-        trial_idx, condition_hash, flip_times, stimulus_type, movie_name, clip_number = ((stimulus.Trial * stimulus.Condition * stimulus.Clip & key).fetch('trial_idx', 'condition_hash', 'flip_times','stimulus_type','movie_name','clip_number', order_by='last_flip ASC'))
-        
-        for i in trial_idx:
-        
-            key['trial_idx'] = trial_idx[i]
-            key['condition_hash'] = condition_hash[i]
-            key['flip_times'] = flip_times[i]
-            key['stimulus_type'] = stimulus_type[i]
-            key['movie_name'] = movie_name[i]
-            key['clip_number'] = int(clip_number[i])
-            self.insert1(key)
-       
     
 @schema            
 class OracleClip(dj.Computed):
     definition = """
-    -> ScanIdx
-    trial_idx: int
-    --- 
+    -> OracleScans
     oracle_hash: varchar(20)
+    --- 
+    number_of_repeats: int     # Number of times a particular hash was repeated
     """ 
     
-    def _make_tuples(self, key):
-        
-        trial_idx, condition_hash, flip_times, stimulus_type, movie_name, clip_number = (TrialInfo() & key).fetch('trial_idx', 'condition_hash', 'flip_times', 'stimulus_type', 'movie_name', 'clip_number')
-        clip_hashes = [i[1] for i in zip(trial_idx, condition_hash, stimulus_type) if i[2] == 'stimulus.Clip']
-        unique_hashes = np.unique(clip_hashes, return_counts=True)
-        oracle_hashes_ = unique_hashes[0][np.where(unique_hashes[1] > 99)]
-        
-        data = [(i[0], i[1], i[2], i[3], i[4], i[5]) for i in zip(trial_idx, condition_hash, flip_times, stimulus_type, movie_name, clip_number)]
-        
-        for i in data:
-            if i[1] in oracle_hashes_:
-                
-                key['trial_idx'] = i[0]
-                key['oracle_hash'] = i[1]
-                self.insert1(key)
-                
-                
 @schema            
 class UnitTrial(dj.Computed):
     definition = """
-    -> ScanIdx
-    unit_id: int
+    -> experiment.Scan
+    -> UnitTraceMethod
     --- 
     
-    """    
+    """  
     
     class Trace(dj.Part):
         definition = """ # Cut out unit traces corresponding to oracle clips
         -> UnitTrial
         -> TrialInfo
-        -> UnitTraceMethod
+        unit_id: int
         ---
         trace: blob
         """
         
-@schema            
+    @schema            
 class PupilTrial(dj.Computed):
     definition = """
-    -> ScanIdx
-    trial_idx: int
+    -> experiment.Scan
+    -> PupilFilterMethod
     --- 
     """
     
-    class Trace(dj.Part):
+    class Radius(dj.Part):
         definition = """ # Cut out pupil traces corresponding to oracle clips
         -> PupilTrial
         -> TrialInfo
-        -> PupilFilterMethod
         ---
         trace: blob
         """
@@ -162,7 +126,7 @@ class PupilTrial(dj.Computed):
 class UnitOracle(dj.Computed):
     definition = """ # Contains the average oracle for every unit
     -> UnitTrial
-    -> UnitTraceMethod
+    -> UnitOracleMethod
     --- 
     unit_oracle: float      # average oracle for all trials in a unit
     """
@@ -179,17 +143,18 @@ class UnitOracle(dj.Computed):
 @schema            
 class PupilOracle(dj.Computed):
     definition = """ # Contains the oracle for every pupil trial
-    -> ScanIdx
-    -> PupilFilterMethod
+    -> PupilTrial
+    -> PupilOracleMethod
     --- 
     pupil_oracle: float      # average pupil oracle for all trials in a scan
     """
     
     class Trial(dj.Part):
         definition = """ # Contains the oracle for every pupil trial
-        -> PupilTrial
         -> PupilOracle
         -> TrialInfo
         ---
         pupil_trial_oracle: float   # oracle for every trial
         """
+        
+    
