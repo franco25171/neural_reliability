@@ -128,7 +128,7 @@ class OracleClip(dj.Computed):
                 
                 
 @schema            
-class UnitTrial(dj.Computed):
+class UnitTrace(dj.Computed):
     definition = """
     -> OracleScans
     -> meso.ScanInfo
@@ -137,7 +137,7 @@ class UnitTrial(dj.Computed):
     
     """  
     
-    class Trace(dj.Part):
+    class Trial(dj.Part):
         definition = """ # Cut out unit traces corresponding to oracle clips
         -> UnitTrial
         -> meso.ScanSet.Unit
@@ -260,7 +260,7 @@ class UnitTrial(dj.Computed):
          
                    
 @schema            
-class PupilTrial(dj.Computed):
+class PupilRadius(dj.Computed):
     definition = """
     -> OracleScans
     -> pupil.Eye
@@ -269,9 +269,9 @@ class PupilTrial(dj.Computed):
     --- 
     """
     
-    class Radius(dj.Part):
+    class Trial(dj.Part):
         definition = """ # Cut out pupil traces corresponding to oracle clips
-        -> PupilTrial
+        -> PupilRadius
         -> TrialInfo
         ---
         condition_hash: varchar(20)
@@ -285,10 +285,11 @@ class PupilTrial(dj.Computed):
     def make(self, key):
         print(key)
         
-        oracle_hashes = (OracleClip().fetch('oracle_hash'))
+        oracle_hashes = ((OracleClip() & key).fetch('oracle_hash'))
 
-        pupil_trace = (pupil.FittedPupil.Circle & key).fetch('radius')
-        pupil_times = (pupil.Eye & key).fetch('eye_time')[0]
+        pupil_trace = (pupil.FittedPupil.Circle() & key).fetch('radius')
+        pupil_times = (pupil.Eye() & key).fetch('eye_time')[0]
+        pupil_times_ = pupil_times.copy()
         depth_num = np.unique((meso.ScanInfo.Field & key).fetch('z')).shape[0]
         scan_times = (stimulus.BehaviorSync() & key).fetch1('frame_times')[::depth_num]
         self.insert1(key)
@@ -296,24 +297,26 @@ class PupilTrial(dj.Computed):
         # Interpolate nan values in pupil signal
         nans, x = nan_helper(pupil_trace)
         pupil_trace[nans]= np.interp(x(nans), x(~nans), pupil_trace[~nans])
+        pupil_times_[nans] = np.interp(x(nans), x(~nans), pupil_times_[~nans])
         
         # Downsample pupil trace
         pupil_trace = interpolate(pupil_trace, pupil_times, scan_times)
         
         # Low pass filter & hamming window band pass filter requirements  
         order = 5
-        fs = len(pupil_times)/pupil_times[-1]       # sample rate, Hz
+        fs = len(pupil_times)/pupil_times_[-1]       # sample rate, Hz
+        print(fs)
         cutoff = 1  # desired cutoff frequency of the filter, Hz
         b, a = butter_lowpass(cutoff, fs, order)    # Get the filter coefficients.
         taps = bandpass_firwin(9, 0.1, 1.0, fs, window='hamming')    # Get filter tapers.
         
         # Get stimulus info
-        all_z = (meso.ScanInfo.Field & key).fetch('z', order_by='field ASC')
+        all_z = np.unique((meso.ScanInfo.Field & key).fetch('z', order_by='field ASC'))
         slice_num = len(all_z) # Number of depths recorded from during scan
         trial_idx, flip_times, condition_hash, stimulus_type, movie_name, clip_number = (TrialInfo() & key).fetch('trial_idx', 'flip_times', 'condition_hash', 'stimulus_type', 'movie_name', 'clip_number', order_by='trial_idx')
         frame_times = (stimulus.Sync & key).fetch1('frame_times')
         
-        field_offset = 0 
+        field_offset = 0 #np.where(all_z == field_z)[0][0]
         frame_times = frame_times[field_offset::slice_num] # Sliced ScanImage times for a single depth of interest
         
         pupil_traces = []
@@ -346,7 +349,7 @@ class PupilTrial(dj.Computed):
                     key['clip_number'] = clip_number[n]
                     key['radius'] = pupil_traces[n][0:min_trace_len]
                     key['radius_diff'] = pupil_traces_diff[n][0:min_trace_len]
-                    PupilTrial.Radius.insert1(key)
+                    PupilRadius.Trial.insert1(key)
                     
         if key['pupil_filter_method'] == 2:
             
@@ -371,7 +374,7 @@ class PupilTrial(dj.Computed):
                     key['clip_number'] = clip_number[n]
                     key['radius'] = pupil_traces[n][0:min_trace_len]
                     key['radius_diff'] = pupil_traces_diff[n][0:min_trace_len]
-                    PupilTrial.Radius.insert1(key)
+                    PupilRadius.Trial.insert1(key)
                     
         if key['pupil_filter_method'] == 3:
             
@@ -396,7 +399,7 @@ class PupilTrial(dj.Computed):
                     key['clip_number'] = clip_number[n]
                     key['radius'] = pupil_traces[n][0:min_trace_len]
                     key['radius_diff'] = pupil_traces_diff[n][0:min_trace_len]
-                    PupilTrial.Radius.insert1(key)
+                    PupilRadius.Trial.insert1(key)
 
                     
 
@@ -407,51 +410,48 @@ class UnitOracle(dj.Computed):
     -> OracleScans
     -> UnitTraceMethod
     -> UnitOracleMethod
+    -> meso.ScanSet.Unit
     --- 
-    
+    unit_oracle: float      # average oracle for all trials in a unit
     """
     
     class Trial(dj.Part):
         definition = """ # Contains the oracle for every unit trial
         -> UnitOracle
-        -> meso.ScanSet.Unit
-        -> TrialInfo 
+        -> TrialInfo
         ---
-        unit_oracle: float      # average oracle for all trials in a unit
         unit_trial_oracle: float   # oracle for every trial in a unit
         """
-        
+                    
     def make(self, key):
         print(key)
         
-        units = (meso.ScanSet.Unit() & key).fetch('unit_id', order_by='unit_id ASC')
+        tuple_ = key.copy()
         
-        for unit in units:
-            unit_id = {'unit_id': unit}
-            unit_traces, trial_idx, segmentation_methods, pipe_versions = (UnitTrial.Trace() * UnitOracleMethod() * meso.ScanSet.Unit() & key & unit_id).fetch('trace', 'trial_idx', 'segmentation_method', 'pipe_version', order_by='trial_idx ASC')
+        unit, unit_traces, trial_idx = (UnitTrial.Trace() * UnitOracleMethod() * meso.ScanSet.Unit() & key).fetch('unit_id', 'trace', 'trial_idx', order_by='trial_idx ASC')
+        unit = np.unique(unit)
 
-            unit_traces_ = []
-            for unit_trace in unit_traces:
-                unit_traces_.append(unit_trace)
+        unit_traces_ = []
+        for unit_trace in unit_traces:
+            unit_traces_.append(unit_trace)
 
-            oracles = calculate_oracle(unit_traces_)
-            unit_mean_oracle = np.mean(oracles)
+        oracles = calculate_oracle(unit_traces_)
+        unit_mean_oracle = np.mean(oracles)
 
-            for oracle, trial, segmentation_method, pipe_version in zip(oracles, trial_idx, segmentation_methods, pipe_versions):
-                key['unit_id'] = unit
-                key['trial_idx'] = trial
-                key['pipe_version'] = pipe_version
-                key['segmentation_method'] = segmentation_method
-                key['unit_oracle'] = unit_mean_oracle 
-                key['unit_trial_oracle'] = oracle
-                UnitOracle.Trial.insert1(key)
-            
+        key['unit_oracle'] = unit_mean_oracle
+        self.insert1(key)
+
+        for oracle, trial in zip(oracles, trial_idx):
+            tuple_['trial_idx'] = trial 
+            tuple_['unit_trial_oracle'] = oracle
+            UnitOracle.Trial.insert1(tuple_)
         
+              
         
 @schema            
 class PupilOracle(dj.Computed):
     definition = """ # Contains the oracle for every pupil trial
-    -> PupilTrial
+    -> PupilRadius
     -> PupilOracleMethod
     --- 
     pupil_oracle: float      # average pupil oracle for all trials in a scan
@@ -464,21 +464,28 @@ class PupilOracle(dj.Computed):
         ---
         pupil_trial_oracle: float   # oracle for every trial
         """
-        
+                
     def make(self, key):
         print(key)
         
-        pupil_traces = (PupilTrial() * PupilOracleMethod() & key).fetch('radius')
+        tuple_ = key.copy()
+
+        pupil_traces, trial_idx = (PupilRadius.Trial() * PupilOracleMethod() & key).fetch('radius', 'trial_idx', order_by='trial_idx ASC')
         
-        oracles = calculate_oracle(pupil_traces)
+        pupil_traces_ = []
+        for pupil_trace in pupil_traces:
+            pupil_traces_.append(pupil_trace)
+
+        oracles = calculate_oracle(pupil_traces_)
         pupil_mean_oracle = np.mean(oracles)
-        
-        key['pupil_oracle'] = unit_mean_oracle
+
+        key['pupil_oracle'] = pupil_mean_oracle
         self.insert1(key)
         
-        for oracle in oracles:
-            key['pupil_trial_oracle'] = oracle
-            PupilOracle.Trial.insert1(key)
+        for oracle, trial in zip(oracles, trial_idx):
+            tuple_['trial_idx'] = trial 
+            tuple_['pupil_trial_oracle'] = oracle
+            PupilOracle.Trial.insert1(tuple_)
             
     
 def normalize_signal(signel, offset=0):
